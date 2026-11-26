@@ -12,7 +12,7 @@ eligible_encounters AS (
     SELECT id, patient, encounterclass, reasoncode
     FROM encounters
     WHERE encounterclass = 'ambulatory'
-      AND reasoncode <> ''
+      AND reasoncode > ''
 ),
 matched_visits AS (
     SELECT
