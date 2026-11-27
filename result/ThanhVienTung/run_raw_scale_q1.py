@@ -1,4 +1,6 @@
 import os
+import re
+import statistics
 import subprocess
 
 PG_BIN = r'C:\Program Files\PostgreSQL\18\bin\psql.exe'
@@ -14,6 +16,16 @@ PG_ENV['PGCLIENTENCODING'] = 'UTF8'
 MY_ENV = os.environ.copy()
 MY_ENV['MYSQL_PWD'] = 'Tungabc123?'
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+Q1_DIR = os.path.abspath(os.path.join(BASE_DIR, '..', '..', 'Query-Optimization-on-Synthea', 'workloads', 'Q1'))
+RAW_LOG_PATH = os.path.join(BASE_DIR, 'RAW_LOGS_SCALE_Q1.md')
+
+
+def read_sql(rel_path):
+    with open(os.path.join(Q1_DIR, rel_path), 'r', encoding='utf-8') as f:
+        return f.read().strip()
+
+
 def run_pg_sql(sql, fail_on_error=True):
     cmd = [PG_BIN, '-h', '127.0.0.1', '-U', 'postgres', '-d', PG_DB,
            '-v', 'ON_ERROR_STOP=1', '-f', '-']
@@ -21,18 +33,9 @@ def run_pg_sql(sql, fail_on_error=True):
     out = res.stdout.decode('utf-8', errors='replace')
     err = res.stderr.decode('utf-8', errors='replace').strip()
     if res.returncode != 0 and fail_on_error:
-        raise RuntimeError(f"PostgreSQL command failed (rc={res.returncode}):\n{err}\nSQL:\n{sql[:300]}")
+        raise RuntimeError(f"PostgreSQL failed (rc={res.returncode}):\n{err}\nSQL:\n{sql[:300]}")
     return out + (f"\n[STDERR]\n{err}" if err else "")
 
-def run_pg_file(filepath):
-    cmd = [PG_BIN, '-h', '127.0.0.1', '-U', 'postgres', '-d', PG_DB,
-           '-v', 'ON_ERROR_STOP=1', '-f', filepath]
-    res = subprocess.run(cmd, env=PG_ENV, capture_output=True)
-    out = res.stdout.decode('utf-8', errors='replace')
-    err = res.stderr.decode('utf-8', errors='replace').strip()
-    if res.returncode != 0:
-        raise RuntimeError(f"PostgreSQL file {filepath} failed (rc={res.returncode}):\n{err}")
-    return out + (f"\n[STDERR]\n{err}" if err else "")
 
 def run_mysql_sql(sql, force=False):
     cmd = [MY_BIN, '-h', '127.0.0.1', '-u', 'root', '--raw']
@@ -43,286 +46,256 @@ def run_mysql_sql(sql, force=False):
     out = res.stdout.decode('utf-8', errors='replace')
     err = res.stderr.decode('utf-8', errors='replace').strip()
     if res.returncode != 0 and not force:
-        raise RuntimeError(f"MySQL command failed (rc={res.returncode}):\n{err}\nSQL:\n{sql[:300]}")
+        raise RuntimeError(f"MySQL failed (rc={res.returncode}):\n{err}\nSQL:\n{sql[:300]}")
     return out + (f"\n[STDERR]\n{err}" if err else "")
 
-def run_mysql_file(filepath, force=False):
-    with open(filepath, 'r', encoding='utf-8') as f:
-        sql_content = f.read()
-    cmd = [MY_BIN, '-h', '127.0.0.1', '-u', 'root', '--raw']
-    if force:
-        cmd.append('--force')
-    cmd.extend([MY_DB])
-    res = subprocess.run(cmd, env=MY_ENV, input=sql_content.encode('utf-8'), capture_output=True)
-    out = res.stdout.decode('utf-8', errors='replace')
-    err = res.stderr.decode('utf-8', errors='replace').strip()
-    if res.returncode != 0 and not force:
-        raise RuntimeError(f"MySQL file {filepath} failed (rc={res.returncode}):\n{err}")
-    return out + (f"\n[STDERR]\n{err}" if err else "")
 
-SQL_BASELINE = """
-SELECT
-    p.id AS patient_id,
-    CONCAT(p.first, ' ', p.last) AS full_name,
-    p.gender,
-    e.id AS encounter_id,
-    e.start AS encounter_start,
-    e.encounterclass,
-    e.total_claim_cost,
-    c.code AS condition_code,
-    c.description AS condition_description,
-    o.code AS observation_code,
-    o.description AS observation_description,
-    o.value AS observation_value,
-    o.units
-FROM patients p
-JOIN encounters e ON e.patient = p.id
-LEFT JOIN conditions c ON c.encounter = e.id AND c.patient = p.id
-JOIN observations o ON o.encounter = e.id AND o.patient = p.id
-WHERE e.encounterclass = 'ambulatory'
-  AND e.start >= TIMESTAMP '2020-01-01 00:00:00'
-  AND e.start <  TIMESTAMP '2021-01-01 00:00:00'
-ORDER BY p.id, e.start, e.id, o.code;
-"""
+def strip_comments_and_semicolon(sql):
+    # Remove /* ... */ block comments first
+    no_block = re.sub(r'/\*.*?\*/', '', sql, flags=re.DOTALL)
+    lines = [ln for ln in no_block.splitlines() if not ln.strip().startswith('--')]
+    cleaned = '\n'.join(lines).strip()
+    if cleaned.endswith(';'):
+        cleaned = cleaned[:-1].strip()
+    return cleaned
 
-SQL_REWRITE_02A = """
-SELECT
-    p.id AS patient_id,
-    CONCAT(p.first, ' ', p.last) AS full_name,
-    p.gender,
-    e.id AS encounter_id,
-    e.start AS encounter_start,
-    e.encounterclass,
-    e.total_claim_cost,
-    c.code AS condition_code,
-    c.description AS condition_description,
-    o.code AS observation_code,
-    o.description AS observation_description,
-    o.value AS observation_value,
-    o.units
-FROM (
-    SELECT id, patient, start, encounterclass, total_claim_cost
-    FROM encounters
-    WHERE encounterclass = 'ambulatory'
-      AND start >= TIMESTAMP '2020-01-01 00:00:00'
-      AND start <  TIMESTAMP '2021-01-01 00:00:00'
-) e
-JOIN patients p      ON p.id = e.patient
-JOIN observations o  ON o.encounter = e.id
-LEFT JOIN conditions c ON c.encounter = e.id
-ORDER BY p.id, e.start, e.id, o.code;
-"""
 
-SQL_REWRITE_02B_PG = """
-WITH e AS MATERIALIZED (
-    SELECT id, patient, start, encounterclass, total_claim_cost
-    FROM encounters
-    WHERE encounterclass = 'ambulatory'
-      AND start >= TIMESTAMP '2020-01-01 00:00:00'
-      AND start <  TIMESTAMP '2021-01-01 00:00:00'
-)
-SELECT
-    p.id AS patient_id,
-    CONCAT(p.first, ' ', p.last) AS full_name,
-    p.gender,
-    e.id AS encounter_id,
-    e.start AS encounter_start,
-    e.encounterclass,
-    e.total_claim_cost,
-    c.code AS condition_code,
-    c.description AS condition_description,
-    o.code AS observation_code,
-    o.description AS observation_description,
-    o.value AS observation_value,
-    o.units
-FROM e
-JOIN patients p      ON p.id = e.patient
-JOIN observations o  ON o.encounter = e.id
-LEFT JOIN conditions c ON c.encounter = e.id
-ORDER BY p.id, e.start, e.id, o.code;
-"""
+def measure_pg_timing(query_sql):
+    q = strip_comments_and_semicolon(query_sql)
+    script_parts = ["\\timing on", "\\o NUL"]
+    for _ in range(6):  # 1 warm-up + 5 measured
+        script_parts.append(q + ";")
+    script_parts.append("\\o")
+    out = run_pg_sql("\n".join(script_parts))
+    times = [float(m.group(1).replace(',', '.')) for m in re.finditer(r'Time:\s+([\d.,]+)\s+ms', out)]
+    return times[1:6], out
 
-SQL_EQUIV = """
-SELECT
-  (SELECT COUNT(*)
-   FROM patients p
-   JOIN encounters e ON e.patient = p.id
-   LEFT JOIN conditions c ON c.encounter = e.id AND c.patient = p.id
-   JOIN observations o ON o.encounter = e.id AND o.patient = p.id
-   WHERE e.encounterclass = 'ambulatory'
-     AND e.start >= TIMESTAMP '2020-01-01 00:00:00'
-     AND e.start <  TIMESTAMP '2021-01-01 00:00:00') AS n_baseline,
-  (SELECT COUNT(*)
-   FROM (
-       SELECT id, patient, start, encounterclass, total_claim_cost
-       FROM encounters
-       WHERE encounterclass = 'ambulatory'
-         AND start >= TIMESTAMP '2020-01-01 00:00:00'
-         AND start <  TIMESTAMP '2021-01-01 00:00:00'
-   ) e
-   JOIN patients p       ON p.id = e.patient
-   JOIN observations o   ON o.encounter = e.id
-   LEFT JOIN conditions c ON c.encounter = e.id) AS n_rewrite;
-"""
 
-def reset_all():
-    run_pg_sql("""
-    DROP INDEX IF EXISTS idx_q1_enc_class_start;
-    DROP INDEX IF EXISTS idx_q1_obs_enc_patient;
-    DROP INDEX IF EXISTS idx_q1_cond_enc_patient;
-    ALTER TABLE encounters   ALTER COLUMN encounterclass SET STATISTICS -1;
-    ALTER TABLE encounters   ALTER COLUMN start          SET STATISTICS -1;
-    ALTER TABLE encounters   ALTER COLUMN patient        SET STATISTICS -1;
-    ALTER TABLE observations ALTER COLUMN encounter      SET STATISTICS -1;
-    ALTER TABLE observations ALTER COLUMN patient        SET STATISTICS -1;
-    ALTER TABLE conditions   ALTER COLUMN encounter      SET STATISTICS -1;
-    ALTER TABLE conditions   ALTER COLUMN patient        SET STATISTICS -1;
-    ANALYZE encounters; ANALYZE observations; ANALYZE conditions; ANALYZE patients;
-    """)
-    run_mysql_sql("""
-    DROP INDEX idx_q1_enc_class_start  ON encounters;
-    DROP INDEX idx_q1_obs_enc_patient  ON observations;
-    DROP INDEX idx_q1_cond_enc_patient ON conditions;
-    ANALYZE TABLE encounters DROP HISTOGRAM ON encounterclass, start;
-    ALTER TABLE encounters   STATS_SAMPLE_PAGES = DEFAULT;
-    ALTER TABLE observations STATS_SAMPLE_PAGES = DEFAULT;
-    ALTER TABLE conditions   STATS_SAMPLE_PAGES = DEFAULT;
-    ALTER TABLE patients     STATS_SAMPLE_PAGES = DEFAULT;
-    ANALYZE TABLE patients, encounters, conditions, observations;
-    """, force=True)
+def measure_mysql_timing(query_sql):
+    q = strip_comments_and_semicolon(query_sql)
+    script_parts = []
+    for _ in range(6):  # 1 warm-up + 5 measured
+        script_parts.append("SET @t0 = SYSDATE(6);")
+        script_parts.append(q + ";")
+        script_parts.append("SELECT CONCAT('TIMING_MS=', ROUND(TIMESTAMPDIFF(MICROSECOND, @t0, SYSDATE(6)) / 1000.0, 3)) AS t;")
+    out = run_mysql_sql("\n".join(script_parts))
+    times = [float(m.group(1)) for m in re.finditer(r'TIMING_MS=([\d.]+)', out)]
+    measured = times[1:6] if len(times) >= 6 else times
+    timing_lines = [ln for ln in out.splitlines() if 'TIMING_MS=' in ln]
+    return measured, '\n'.join(timing_lines)
+
+
+def run_pg_explain_5(query_sql):
+    q = strip_comments_and_semicolon(query_sql)
+    plans = []
+    for i in range(1, 6):
+        out = run_pg_sql(f"SET track_io_timing = on;\nEXPLAIN (ANALYZE, BUFFERS, SETTINGS) {q};")
+        plans.append((i, out.strip()))
+    return plans
+
+
+def run_mysql_explain_5(query_sql):
+    q = strip_comments_and_semicolon(query_sql)
+    plans = []
+    for i in range(1, 6):
+        out = run_mysql_sql(f"EXPLAIN ANALYZE {q};")
+        plans.append((i, out.strip()))
+    return plans
+
 
 def main():
-    reset_all()
-    logs = []
-    logs.append("# RAW LOGS TẤT CẢ CÁC LẦN CHẠY TRÊN DỮ LIỆU SCALE (synthea_scale - 10X)\n")
+    pg_baseline = read_sql('postgres/baseline.sql')
+    pg_rewrite = read_sql('postgres/rewrite.sql')
+    pg_idx_setup = read_sql('postgres/index_setup.sql')
+    pg_idx_teardown = read_sql('postgres/index_teardown.sql')
+    pg_stats_setup = read_sql('postgres/stats_setup.sql')
+    pg_stats_teardown = read_sql('postgres/stats_teardown.sql')
+    pg_comb_setup = read_sql('postgres/combined_setup.sql')
+    pg_comb_teardown = read_sql('postgres/combined_teardown.sql')
 
-    # 0. Version verification
-    print("Recording Server Versions...")
+    my_baseline = read_sql('mysql/baseline.sql')
+    my_rewrite = read_sql('mysql/rewrite.sql')
+    my_idx_setup = read_sql('mysql/index_setup.sql')
+    my_idx_teardown = read_sql('mysql/index_teardown.sql')
+    my_stats_setup = read_sql('mysql/stats_setup.sql')
+    my_stats_teardown = read_sql('mysql/stats_teardown.sql')
+    my_comb_setup = read_sql('mysql/combined_setup.sql')
+    my_comb_teardown = read_sql('mysql/combined_teardown.sql')
+
+    print("Resetting Q1 objects on PG & MySQL...")
+    run_pg_sql(pg_idx_teardown + "\n" + pg_stats_teardown)
+    run_mysql_sql(my_idx_teardown + "\n" + my_stats_teardown, force=True)
+
+    logs = []
+    logs.append("# RAW LOGS TẤT CẢ CÁC LẦN CHẠY Q1 TRÊN DỮ LIỆU SCALE 10X THUẦN (synthea_scale)\n")
+
+    # 0. Versions, env, D0 sizes, equivalence
+    print("0. Collecting versions, environment, D0 sizes, and equivalence...")
     pg_ver = run_pg_sql("SELECT version();").strip()
     my_ver = run_mysql_sql("SELECT VERSION();").strip()
-    logs.append("## 0. Phiên bản Hệ quản trị CSDL (Server Versions)\n```text\n" + pg_ver + "\n\n" + my_ver + "\n```\n")
+    logs.append("## 0. Phiên bản Hệ quản trị CSDL & Thông số môi trường\n```text\n" + pg_ver + "\n\n" + my_ver + "\n```\n")
 
-    # ---------------- 1. Q1_01_baseline ----------------
-    print("Running Q1_01_baseline...")
-    logs.append("## 1. Q1_01_baseline_pg.sql (Full file + 5 lần EXPLAIN)\n")
-    logs.append("### Full File Execution (`psql -f Q1_01_baseline_pg.sql`):\n```text\n" + run_pg_file("claude_step1/Q1_01_baseline_pg.sql").strip() + "\n```\n")
-    for i in range(1, 6):
-        logs.append(f"### PG Baseline Run {i}:\n```text\n" + run_pg_sql(f"SET track_io_timing = on; EXPLAIN (ANALYZE, BUFFERS, SETTINGS) {SQL_BASELINE}").strip() + "\n```\n")
+    pg_env_info = run_pg_sql("""
+        SHOW work_mem;
+        SHOW shared_buffers;
+        SHOW effective_cache_size;
+        SHOW max_parallel_workers_per_gather;
+        SELECT relname AS table_name,
+               n_live_tup AS est_rows,
+               pg_total_relation_size(relid) AS total_bytes,
+               pg_size_pretty(pg_total_relation_size(relid)) AS total_size
+        FROM pg_stat_user_tables
+        WHERE relname IN ('patients', 'encounters', 'conditions', 'observations')
+        ORDER BY relname;
+        SELECT SUM(pg_total_relation_size(relid)) AS d0_bytes,
+               ROUND(SUM(pg_total_relation_size(relid)) / 1048576.0, 2) AS d0_mb
+        FROM pg_stat_user_tables
+        WHERE relname IN ('patients', 'encounters', 'conditions', 'observations');
+    """).strip()
 
-    logs.append("## 2. Q1_01_baseline_mysql.sql (Full file + 5 lần EXPLAIN)\n")
-    logs.append("### Full File Execution (`mysql < Q1_01_baseline_mysql.sql`):\n```text\n" + run_mysql_file("claude_step1/Q1_01_baseline_mysql.sql").strip() + "\n```\n")
-    for i in range(1, 6):
-        logs.append(f"### MySQL Baseline Run {i}:\n```text\n" + run_mysql_sql(f"EXPLAIN ANALYZE {SQL_BASELINE}").strip() + "\n```\n")
+    my_env_info = run_mysql_sql("""
+        SELECT @@sort_buffer_size AS sort_buffer_size,
+               @@join_buffer_size AS join_buffer_size,
+               @@innodb_buffer_pool_size AS innodb_buffer_pool_size,
+               @@tmp_table_size AS tmp_table_size;
+        SELECT TABLE_NAME, TABLE_ROWS,
+               DATA_LENGTH + INDEX_LENGTH AS total_bytes,
+               ROUND((DATA_LENGTH + INDEX_LENGTH) / 1048576.0, 2) AS total_mb
+        FROM information_schema.TABLES
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME IN ('patients', 'encounters', 'conditions', 'observations')
+        ORDER BY TABLE_NAME;
+        SELECT SUM(DATA_LENGTH + INDEX_LENGTH) AS d0_bytes,
+               ROUND(SUM(DATA_LENGTH + INDEX_LENGTH) / 1048576.0, 2) AS d0_mb
+        FROM information_schema.TABLES
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME IN ('patients', 'encounters', 'conditions', 'observations');
+    """).strip()
 
-    # ---------------- 2. Q1_02_rewrite ----------------
-    print("Running Q1_02_rewrite...")
-    logs.append("## 3. Q1_02_rewrite_pg.sql (Full file + 5 lần 02a & 5 lần 02b)\n")
-    logs.append("### Full File Execution (`psql -f Q1_02_rewrite_pg.sql`):\n```text\n" + run_pg_file("claude_step1/Q1_02_rewrite_pg.sql").strip() + "\n```\n")
-    for i in range(1, 6):
-        logs.append(f"### PG Rewrite 02a Run {i}:\n```text\n" + run_pg_sql(f"SET track_io_timing = on; EXPLAIN (ANALYZE, BUFFERS, SETTINGS) {SQL_REWRITE_02A}").strip() + "\n```\n")
-    for i in range(1, 6):
-        logs.append(f"### PG Rewrite 02b Run {i}:\n```text\n" + run_pg_sql(f"SET track_io_timing = on; EXPLAIN (ANALYZE, BUFFERS, SETTINGS) {SQL_REWRITE_02B_PG}").strip() + "\n```\n")
+    logs.append("### Thông số môi trường & Dung lượng D0 (patients, encounters, conditions, observations)\n```text\n" + pg_env_info + "\n\n" + my_env_info + "\n```\n")
 
-    logs.append("## 4. Q1_02_rewrite_mysql.sql (Full file + 5 lần 02a & 5 lần 02b)\n")
-    logs.append("### Full File Execution (`mysql < Q1_02_rewrite_mysql.sql`):\n```text\n" + run_mysql_file("claude_step1/Q1_02_rewrite_mysql.sql").strip() + "\n```\n")
-    for i in range(1, 6):
-        logs.append(f"### MySQL Rewrite 02a Run {i}:\n```text\n" + run_mysql_sql(f"EXPLAIN ANALYZE {SQL_REWRITE_02A}").strip() + "\n```\n")
-    for i in range(1, 6):
-        logs.append(f"### MySQL Rewrite 02b Run {i}:\n```text\n" + run_mysql_sql(f"SET SESSION optimizer_switch = 'derived_merge=off'; EXPLAIN ANALYZE {SQL_REWRITE_02A}").strip() + "\n```\n")
+    pg_b_q = strip_comments_and_semicolon(pg_baseline)
+    pg_r_q = strip_comments_and_semicolon(pg_rewrite)
+    my_b_q = strip_comments_and_semicolon(my_baseline)
+    my_r_q = strip_comments_and_semicolon(my_rewrite)
 
-    # ---------------- 3. Q1_03_indexes ----------------
-    print("Running Q1_03_indexes...")
-    logs.append("## 5. Q1_03_indexes_pg.sql (Full file + 5 lần EXPLAIN khi có index)\n")
-    logs.append("### Full File Execution (`psql -f Q1_03_indexes_pg.sql` - gồm tạo & xóa):\n```text\n" + run_pg_file("claude_step1/Q1_03_indexes_pg.sql").strip() + "\n```\n")
-    run_pg_sql("CREATE INDEX idx_q1_enc_class_start ON encounters (encounterclass, start, id, patient); CREATE INDEX idx_q1_obs_enc_patient ON observations (encounter, patient); CREATE INDEX idx_q1_cond_enc_patient ON conditions (encounter, patient);")
-    run_pg_sql(f"SET track_io_timing = on; EXPLAIN (ANALYZE, BUFFERS, SETTINGS) {SQL_BASELINE}") # warm-up
-    for i in range(1, 6):
-        logs.append(f"### PG Index Run {i}:\n```text\n" + run_pg_sql(f"SET track_io_timing = on; EXPLAIN (ANALYZE, BUFFERS, SETTINGS) {SQL_BASELINE}").strip() + "\n```\n")
-    run_pg_sql("DROP INDEX IF EXISTS idx_q1_enc_class_start, idx_q1_obs_enc_patient, idx_q1_cond_enc_patient;")
+    pg_eq = run_pg_sql(f"""
+        SELECT (SELECT COUNT(*) FROM ({pg_b_q}) b) AS n_baseline,
+               (SELECT COUNT(*) FROM ({pg_r_q}) r) AS n_rewrite;
+    """).strip()
+    my_eq = run_mysql_sql(f"""
+        SELECT (SELECT COUNT(*) FROM ({my_b_q}) b) AS n_baseline,
+               (SELECT COUNT(*) FROM ({my_r_q}) r) AS n_rewrite;
+    """).strip()
+    logs.append("### Kiểm tra tương đương kết quả (Equivalence Check)\n```text\n-- PostgreSQL\n" + pg_eq + "\n\n-- MySQL\n" + my_eq + "\n```\n")
 
-    logs.append("## 6. Q1_03_indexes_mysql.sql (Full file + 5 lần EXPLAIN khi có index)\n")
-    logs.append("### Full File Execution (`mysql < Q1_03_indexes_mysql.sql` - gồm tạo & xóa):\n```text\n" + run_mysql_file("claude_step1/Q1_03_indexes_mysql.sql", force=True).strip() + "\n```\n")
-    run_mysql_sql("CREATE INDEX idx_q1_enc_class_start ON encounters (encounterclass, start, patient); CREATE INDEX idx_q1_obs_enc_patient ON observations (encounter, patient); CREATE INDEX idx_q1_cond_enc_patient ON conditions (encounter, patient);")
-    run_mysql_sql(f"EXPLAIN ANALYZE {SQL_BASELINE}") # warm-up
-    for i in range(1, 6):
-        logs.append(f"### MySQL Index Run {i}:\n```text\n" + run_mysql_sql(f"EXPLAIN ANALYZE {SQL_BASELINE}").strip() + "\n```\n")
-    run_mysql_sql("DROP INDEX idx_q1_enc_class_start ON encounters; DROP INDEX idx_q1_obs_enc_patient ON observations; DROP INDEX idx_q1_cond_enc_patient ON conditions;", force=True)
+    # ---------------- 1. BASELINE ----------------
+    print("1. Running Q1 Baseline (PG & MySQL)...")
+    logs.append("## 1. Q1 Baseline\n")
+    pg_t_base, pg_t_base_raw = measure_pg_timing(pg_baseline)
+    logs.append(f"### PG Baseline Timing (5 runs after 1 warm-up): {pg_t_base} | median={statistics.median(pg_t_base):.3f} ms\n```text\n{pg_t_base_raw.strip()}\n```\n")
+    for i, out in run_pg_explain_5(pg_baseline):
+        logs.append(f"### PG Baseline EXPLAIN Run {i}:\n```text\n{out}\n```\n")
 
-    # ---------------- 4. Q1_04_stats ----------------
-    print("Running Q1_04_stats...")
-    logs.append("## 7. Q1_04_stats_pg.sql (Full file + 5 lần EXPLAIN sau khi SET STATISTICS 1000)\n")
-    logs.append("### Full File Execution (`psql -f Q1_04_stats_pg.sql` - gồm trước, sau & khôi phục):\n```text\n" + run_pg_file("claude_step1/Q1_04_stats_pg.sql").strip() + "\n```\n")
-    run_pg_sql("""
-    ALTER TABLE encounters   ALTER COLUMN encounterclass SET STATISTICS 1000;
-    ALTER TABLE encounters   ALTER COLUMN start          SET STATISTICS 1000;
-    ALTER TABLE encounters   ALTER COLUMN patient        SET STATISTICS 1000;
-    ALTER TABLE observations ALTER COLUMN encounter      SET STATISTICS 1000;
-    ALTER TABLE observations ALTER COLUMN patient        SET STATISTICS 1000;
-    ALTER TABLE conditions   ALTER COLUMN encounter      SET STATISTICS 1000;
-    ALTER TABLE conditions   ALTER COLUMN patient        SET STATISTICS 1000;
-    ANALYZE encounters; ANALYZE observations; ANALYZE conditions; ANALYZE patients;
-    """)
-    run_pg_sql(f"SET track_io_timing = on; EXPLAIN (ANALYZE, BUFFERS, SETTINGS) {SQL_BASELINE}") # warm-up
-    for i in range(1, 6):
-        logs.append(f"### PG Stats Run {i}:\n```text\n" + run_pg_sql(f"SET track_io_timing = on; EXPLAIN (ANALYZE, BUFFERS, SETTINGS) {SQL_BASELINE}").strip() + "\n```\n")
-    reset_all()
+    my_t_base, my_t_base_raw = measure_mysql_timing(my_baseline)
+    logs.append(f"### MySQL Baseline Timing (5 runs after 1 warm-up): {my_t_base} | median={statistics.median(my_t_base):.3f} ms\n```text\n{my_t_base_raw.strip()}\n```\n")
+    for i, out in run_mysql_explain_5(my_baseline):
+        logs.append(f"### MySQL Baseline EXPLAIN Run {i}:\n```text\n{out}\n```\n")
 
-    logs.append("## 8. Q1_04_stats_mysql.sql (Full file + 5 lần EXPLAIN sau khi STATS_SAMPLE_PAGES=200 & Hist)\n")
-    logs.append("### Full File Execution (`mysql < Q1_04_stats_mysql.sql` - gồm trước, sau & khôi phục):\n```text\n" + run_mysql_file("claude_step1/Q1_04_stats_mysql.sql").strip() + "\n```\n")
-    run_mysql_sql("""
-    ALTER TABLE encounters   STATS_SAMPLE_PAGES = 200;
-    ALTER TABLE observations STATS_SAMPLE_PAGES = 200;
-    ALTER TABLE conditions   STATS_SAMPLE_PAGES = 200;
-    ALTER TABLE patients     STATS_SAMPLE_PAGES = 200;
-    ANALYZE TABLE patients, encounters, conditions, observations;
-    ANALYZE TABLE encounters UPDATE HISTOGRAM ON encounterclass, start WITH 100 BUCKETS;
-    """)
-    run_mysql_sql(f"EXPLAIN ANALYZE {SQL_BASELINE}") # warm-up
-    for i in range(1, 6):
-        logs.append(f"### MySQL Stats Run {i}:\n```text\n" + run_mysql_sql(f"EXPLAIN ANALYZE {SQL_BASELINE}").strip() + "\n```\n")
-    reset_all()
+    # ---------------- 2. REWRITE ----------------
+    print("2. Running Q1 Rewrite (PG & MySQL)...")
+    logs.append("## 2. Q1 Rewrite (02a)\n")
+    pg_t_rew, pg_t_rew_raw = measure_pg_timing(pg_rewrite)
+    logs.append(f"### PG Rewrite Timing (5 runs after 1 warm-up): {pg_t_rew} | median={statistics.median(pg_t_rew):.3f} ms\n```text\n{pg_t_rew_raw.strip()}\n```\n")
+    for i, out in run_pg_explain_5(pg_rewrite):
+        logs.append(f"### PG Rewrite EXPLAIN Run {i}:\n```text\n{out}\n```\n")
 
-    # ---------------- 5. Q1_05_combined ----------------
-    print("Running Q1_05_combined...")
-    logs.append("## 9. Q1_05_combined_pg.sql (Check + Equiv + Setup + 5 lần EXPLAIN + pg_stat_user_indexes + Reset)\n")
-    pg_comb_setup = run_pg_sql(f"""
-    SELECT tablename, indexname FROM pg_indexes WHERE schemaname = current_schema() AND indexname LIKE 'idx_q1_%';
-    {SQL_EQUIV}
-    CREATE INDEX idx_q1_enc_class_start  ON encounters   (encounterclass, start, id, patient);
-    CREATE INDEX idx_q1_obs_enc_patient  ON observations (encounter, patient);
-    CREATE INDEX idx_q1_cond_enc_patient ON conditions   (encounter, patient);
-    SELECT indexrelid::regclass AS index_name, pg_size_pretty(pg_relation_size(indexrelid)) AS size FROM pg_index WHERE indexrelid::regclass::text LIKE 'idx_q1_%';
-    """)
-    logs.append("### PG Combined Check, Equivalence & Setup:\n```text\n" + pg_comb_setup.strip() + "\n```\n")
-    run_pg_sql(f"SET track_io_timing = on; RESET enable_seqscan; EXPLAIN (ANALYZE, BUFFERS, SETTINGS) {SQL_REWRITE_02A}") # warm-up
-    for i in range(1, 6):
-        logs.append(f"### PG Combined Run {i}:\n```text\n" + run_pg_sql(f"SET track_io_timing = on; RESET enable_seqscan; EXPLAIN (ANALYZE, BUFFERS, SETTINGS) {SQL_REWRITE_02A}").strip() + "\n```\n")
-    pg_comb_usage = run_pg_sql("SELECT pg_stat_force_next_flush(); SELECT relname AS table_name, indexrelname AS index_name, idx_scan FROM pg_stat_user_indexes WHERE indexrelname LIKE 'idx_q1_%' ORDER BY relname;")
-    logs.append("### PG Combined Index Usage:\n```text\n" + pg_comb_usage.strip() + "\n```\n")
-    run_pg_sql("DROP INDEX IF EXISTS idx_q1_enc_class_start, idx_q1_obs_enc_patient, idx_q1_cond_enc_patient; RESET enable_seqscan;")
+    my_t_rew, my_t_rew_raw = measure_mysql_timing(my_rewrite)
+    logs.append(f"### MySQL Rewrite Timing (5 runs after 1 warm-up): {my_t_rew} | median={statistics.median(my_t_rew):.3f} ms\n```text\n{my_t_rew_raw.strip()}\n```\n")
+    for i, out in run_mysql_explain_5(my_rewrite):
+        logs.append(f"### MySQL Rewrite EXPLAIN Run {i}:\n```text\n{out}\n```\n")
 
-    logs.append("## 10. Q1_05_combined_mysql.sql (Check + Equiv + Setup + TRUNCATE perf_schema + 5 lần EXPLAIN + COUNT_READ + Reset)\n")
-    my_comb_setup = run_mysql_sql(f"""
-    SELECT TABLE_NAME, INDEX_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND INDEX_NAME LIKE 'idx_q1_%' GROUP BY TABLE_NAME, INDEX_NAME;
-    {SQL_EQUIV}
-    CREATE INDEX idx_q1_enc_class_start  ON encounters   (encounterclass, start, patient);
-    CREATE INDEX idx_q1_obs_enc_patient  ON observations (encounter, patient);
-    CREATE INDEX idx_q1_cond_enc_patient ON conditions   (encounter, patient);
-    SELECT TABLE_NAME, INDEX_NAME, ROUND(stat_value * @@innodb_page_size / 1024) AS size_kb FROM mysql.innodb_index_stats WHERE database_name = DATABASE() AND stat_name = 'size' AND INDEX_NAME LIKE 'idx_q1_%';
-    TRUNCATE TABLE performance_schema.table_io_waits_summary_by_index_usage;
-    """)
-    logs.append("### MySQL Combined Check, Equivalence, Setup & Truncate Perf Schema:\n```text\n" + my_comb_setup.strip() + "\n```\n")
-    run_mysql_sql(f"SET SESSION optimizer_switch = 'derived_merge=on'; EXPLAIN ANALYZE {SQL_REWRITE_02A}") # warm-up
-    for i in range(1, 6):
-        logs.append(f"### MySQL Combined Run {i}:\n```text\n" + run_mysql_sql(f"SET SESSION optimizer_switch = 'derived_merge=on'; EXPLAIN ANALYZE {SQL_REWRITE_02A}").strip() + "\n```\n")
-    my_comb_usage = run_mysql_sql("SELECT OBJECT_NAME AS table_name, INDEX_NAME, COUNT_READ FROM performance_schema.table_io_waits_summary_by_index_usage WHERE OBJECT_SCHEMA = DATABASE() AND INDEX_NAME LIKE 'idx_q1_%' ORDER BY OBJECT_NAME;")
-    logs.append("### MySQL Combined Index Usage (Clean Count):\n```text\n" + my_comb_usage.strip() + "\n```\n")
-    reset_all()
+    # ---------------- 3. INDEXES ----------------
+    print("3. Running Q1 Indexes (PG & MySQL)...")
+    logs.append("## 3. Q1 Indexes (no ANALYZE)\n")
+    pg_idx_out = run_pg_sql("\\timing on\n" + pg_idx_setup).strip()
+    pg_idx_size = run_pg_sql("""
+        SELECT indexname,
+               pg_relation_size(quote_ident(schemaname) || '.' || quote_ident(indexname)) AS size_bytes,
+               pg_size_pretty(pg_relation_size(quote_ident(schemaname) || '.' || quote_ident(indexname))) AS size
+        FROM pg_indexes WHERE indexname LIKE 'idx_q1_%' ORDER BY indexname;
+        SELECT SUM(pg_relation_size(quote_ident(schemaname) || '.' || quote_ident(indexname))) AS delta_d_bytes,
+               ROUND(SUM(pg_relation_size(quote_ident(schemaname) || '.' || quote_ident(indexname))) / 1048576.0, 2) AS delta_d_mb
+        FROM pg_indexes WHERE indexname LIKE 'idx_q1_%';
+    """).strip()
+    logs.append("### PG Index Setup & Sizes\n```text\n" + pg_idx_out + "\n\n" + pg_idx_size + "\n```\n")
+    pg_t_idx, _ = measure_pg_timing(pg_baseline)
+    logs.append(f"### PG Index Timing (5 runs after 1 warm-up): {pg_t_idx} | median={statistics.median(pg_t_idx):.3f} ms\n")
+    for i, out in run_pg_explain_5(pg_baseline):
+        logs.append(f"### PG Index EXPLAIN Run {i}:\n```text\n{out}\n```\n")
+    run_pg_sql(pg_idx_teardown)
 
-    out_text = "\n".join(logs)
-    with open("RAW_LOGS_SCALE_Q1.md", "w", encoding="utf-8") as f:
-        f.write(out_text)
-    print(f"DONE! Written RAW_LOGS_SCALE_Q1.md ({len(out_text)} chars)")
+    my_idx_out = run_mysql_sql(my_idx_setup).strip()
+    my_idx_size = run_mysql_sql("""
+        SELECT table_name, index_name, stat_value * @@innodb_page_size AS size_bytes,
+               ROUND((stat_value * @@innodb_page_size) / 1048576.0, 2) AS size_mb
+        FROM mysql.innodb_index_stats
+        WHERE database_name = DATABASE() AND stat_name = 'size' AND index_name LIKE 'idx_q1_%'
+        ORDER BY table_name, index_name;
+        SELECT SUM(stat_value * @@innodb_page_size) AS delta_d_bytes,
+               ROUND(SUM(stat_value * @@innodb_page_size) / 1048576.0, 2) AS delta_d_mb
+        FROM mysql.innodb_index_stats
+        WHERE database_name = DATABASE() AND stat_name = 'size' AND index_name LIKE 'idx_q1_%';
+    """).strip()
+    logs.append("### MySQL Index Setup & Sizes\n```text\n" + my_idx_out + "\n\n" + my_idx_size + "\n```\n")
+    my_t_idx, _ = measure_mysql_timing(my_baseline)
+    logs.append(f"### MySQL Index Timing (5 runs after 1 warm-up): {my_t_idx} | median={statistics.median(my_t_idx):.3f} ms\n")
+    for i, out in run_mysql_explain_5(my_baseline):
+        logs.append(f"### MySQL Index EXPLAIN Run {i}:\n```text\n{out}\n```\n")
+    run_mysql_sql(my_idx_teardown, force=True)
 
-if __name__ == "__main__":
+    # ---------------- 4. STATS ----------------
+    print("4. Running Q1 Stats (PG & MySQL)...")
+    logs.append("## 4. Q1 Statistics\n")
+    pg_stats_out = run_pg_sql(pg_stats_setup).strip()
+    logs.append("### PG Stats Setup\n```text\n" + pg_stats_out + "\n```\n")
+    pg_t_stats, _ = measure_pg_timing(pg_baseline)
+    logs.append(f"### PG Stats Timing (5 runs after 1 warm-up): {pg_t_stats} | median={statistics.median(pg_t_stats):.3f} ms\n")
+    for i, out in run_pg_explain_5(pg_baseline):
+        logs.append(f"### PG Stats EXPLAIN Run {i}:\n```text\n{out}\n```\n")
+    run_pg_sql(pg_stats_teardown)
+
+    my_stats_out = run_mysql_sql(my_stats_setup).strip()
+    logs.append("### MySQL Stats Setup\n```text\n" + my_stats_out + "\n```\n")
+    my_t_stats, _ = measure_mysql_timing(my_baseline)
+    logs.append(f"### MySQL Stats Timing (5 runs after 1 warm-up): {my_t_stats} | median={statistics.median(my_t_stats):.3f} ms\n")
+    for i, out in run_mysql_explain_5(my_baseline):
+        logs.append(f"### MySQL Stats EXPLAIN Run {i}:\n```text\n{out}\n```\n")
+    run_mysql_sql(my_stats_teardown, force=True)
+
+    # ---------------- 5. COMBINED ----------------
+    print("5. Running Q1 Combined (PG & MySQL)...")
+    logs.append("## 5. Q1 Combined (Rewrite 02a + Indexes, no ANALYZE)\n")
+    pg_comb_out = run_pg_sql("\\timing on\n" + pg_comb_setup).strip()
+    logs.append("### PG Combined Setup\n```text\n" + pg_comb_out + "\n```\n")
+    pg_t_comb, _ = measure_pg_timing(pg_rewrite)
+    logs.append(f"### PG Combined Timing (5 runs after 1 warm-up): {pg_t_comb} | median={statistics.median(pg_t_comb):.3f} ms\n")
+    for i, out in run_pg_explain_5(pg_rewrite):
+        logs.append(f"### PG Combined EXPLAIN Run {i}:\n```text\n{out}\n```\n")
+    run_pg_sql(pg_comb_teardown)
+
+    my_comb_out = run_mysql_sql(my_comb_setup).strip()
+    logs.append("### MySQL Combined Setup\n```text\n" + my_comb_out + "\n```\n")
+    my_t_comb, _ = measure_mysql_timing(my_rewrite)
+    logs.append(f"### MySQL Combined Timing (5 runs after 1 warm-up): {my_t_comb} | median={statistics.median(my_t_comb):.3f} ms\n")
+    for i, out in run_mysql_explain_5(my_rewrite):
+        logs.append(f"### MySQL Combined EXPLAIN Run {i}:\n```text\n{out}\n```\n")
+    run_mysql_sql(my_comb_teardown, force=True)
+
+    with open(RAW_LOG_PATH, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(logs))
+    print(f"Done! Saved raw logs to {RAW_LOG_PATH}")
+
+
+if __name__ == '__main__':
     main()
