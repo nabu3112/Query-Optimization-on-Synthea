@@ -1,9 +1,3 @@
--- Q2 | MySQL 8.4 | baseline
--- Original query, no optimization applied.
--- Plan:   run as EXPLAIN ANALYZE <this query>  -> record time, estimated vs actual rows.
--- Timing: run the query alone (without EXPLAIN) for the time measure.
--- Reference result: 985 rows.
-
 SELECT
     p.id AS patient_id,
     CONCAT(p.first, ' ', p.last) AS full_name,

@@ -1,8 +1,3 @@
--- Q2 | MySQL 8.4 | rewrite
--- Only change vs baseline: e.reasoncode <> ''  ->  e.reasoncode > ''.
--- Same result (985 rows). Use the same rewritten text on both DBMS for a fair comparison.
--- Run as EXPLAIN ANALYZE for the plan, and alone for timing.
-
 SELECT
     p.id AS patient_id,
     CONCAT(p.first, ' ', p.last) AS full_name,

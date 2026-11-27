@@ -1,9 +1,3 @@
--- Q2 | PostgreSQL 18 | rewrite
--- Only change vs baseline: e.reasoncode <> ''  ->  e.reasoncode > ''.
--- Same result (985 rows on the reference dataset): both conditions exclude NULL and empty strings.
--- Why: a B-tree index cannot be used for <>, but can be used for a range condition (> '').
--- Run as EXPLAIN (ANALYZE, BUFFERS) for the plan, and alone for timing.
-
 SELECT
     p.id AS patient_id,
     CONCAT(p.first, ' ', p.last) AS full_name,
